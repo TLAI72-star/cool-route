@@ -10,3 +10,6 @@ desktop.ini
 # Windows APIs refuse to open it — excluded here, delete manually:
 #   cmd.exe:  del "\\?\C:\Users\micha\OneDrive - Hong Kong Baptist University\Coding project\CoolRoute\prototype\NUL"
 /prototype/NUL
+
+# Local release packages (zips are attached to GitHub Releases instead)
+/dist/
