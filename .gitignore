@@ -1,0 +1,12 @@
+# Local assistant/project memory — keep out of the public repo
+.workbuddy-ai/
+
+# Windows / OneDrive noise
+Thumbs.db
+Desktop.ini
+desktop.ini
+
+# Reserved device-name junk file created by a shell redirect mishap;
+# Windows APIs refuse to open it — excluded here, delete manually:
+#   cmd.exe:  del "\\?\C:\Users\micha\OneDrive - Hong Kong Baptist University\Coding project\CoolRoute\prototype\NUL"
+/prototype/NUL

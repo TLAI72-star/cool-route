@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>CoolRoute v1 — Heat-aware routing · Central, Hong Kong</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <header class="brand">
+      <div class="logo">❄</div>
+      <div>
+        <h1>CoolRoute</h1>
+        <p class="tagline">Heat-aware routing · Central pilot · v1 prototype</p>
+      </div>
+    </header>
+
+    <section class="panel" id="od-panel">
+      <div class="od-row">
+        <span class="dot dot-a">A</span>
+        <select id="sel-a"></select>
+        <button class="mini" id="pick-a" title="Set A by clicking the map">⌖</button>
+      </div>
+      <div class="od-row">
+        <span class="dot dot-b">B</span>
+        <select id="sel-b"></select>
+        <button class="mini" id="pick-b" title="Set B by clicking the map">⌖</button>
+      </div>
+      <button id="swap" class="ghost">⇅ Swap</button>
+    </section>
+
+    <section class="panel">
+      <div class="row-between">
+        <label for="depart">Departure <strong id="depart-label">14:00</strong></label>
+        <button class="mini" id="now-btn">Now</button>
+      </div>
+      <input type="range" id="depart" min="6" max="21" step="0.5" value="14" />
+      <div id="sun-line" class="hint"></div>
+    </section>
+
+    <section class="panel" id="weather-card">
+      <h2>Weather <span id="wx-source" class="badge">…</span></h2>
+      <div id="wx-grid" class="wx-grid"></div>
+      <div id="wx-stale" class="stale hidden">⚠ Weather service unavailable — using last valid snapshot (stale data).</div>
+    </section>
+
+    <section class="panel">
+      <label for="sens">Heat sensitivity <span class="hint">(personalisation)</span></label>
+      <input type="range" id="sens" min="0" max="1" step="0.05" value="0.5" />
+      <div class="hint" id="sens-label">Balanced trade-off</div>
+    </section>
+
+    <section id="routes"></section>
+
+    <section class="panel" id="compare">
+      <h2>Route comparison</h2>
+      <div id="compare-bars"></div>
+    </section>
+
+    <section class="panel legend">
+      <h2>Legend</h2>
+      <div class="legend-row"><span class="sw" style="background:#f59e0b"></span>Fastest — real foot path, min time</div>
+      <div class="legend-row"><span class="sw" style="background:#06b6d4"></span>Coolest — min heat exposure</div>
+      <div class="legend-row"><span class="sw" style="background:#8b5cf6"></span>Balanced — time + heat trade-off</div>
+      <div class="hint" style="margin-top:6px">Routes follow the real OSM pedestrian network (OSRM foot demo server). ❄ = cooling point · click a route line or card to highlight.</div>
+    </section>
+
+    <button id="method-btn" class="ghost wide">Methodology, data sources &amp; licences</button>
+    <p class="disclaimer">Prototype: demo thermal estimates on real streets, relative scores only — not a medical or safety guarantee.</p>
+  </aside>
+
+  <main id="map-wrap">
+    <div id="map"></div>
+    <div id="banner" class="hidden"></div>
+  </main>
+</div>
+
+<dialog id="method-dialog">
+  <h2>How CoolRoute v1 works</h2>
+  <p>Deterministic, explainable baseline (per the system architecture guide): sun position → street-canyon shade → edge heat cost → three routing objectives.</p>
+  <h3>Edge heat cost</h3>
+  <code>EdgeHeatCost = length × (w1·HeatIndex + w2·SunExposure + w3·LowWind + w4·SurfaceHeatProxy − w5·CoolingAccess)</code>
+  <p class="hint">w1&nbsp;=&nbsp;0.35, w2&nbsp;=&nbsp;0.30, w3&nbsp;=&nbsp;0.10, w4&nbsp;=&nbsp;0.15, w5&nbsp;=&nbsp;0.10 — initial domain weights, to be calibrated with pilot survey data. Scores are normalised 0–100 and used <em>only</em> for relative route comparison.</p>
+  <h3>Routing (real streets)</h3>
+  <p>Route candidates come from an <strong>OSRM foot-profile demo server</strong> (routing.openstreetmap.de, OpenStreetMap data, no API key): the direct query plus its alternatives and a few shade-corridor waypoint variants are deduplicated, then each candidate is scored thermally per ~30 m segment. Each segment's street name (from the API) maps to a Central canyon table (width, podium height, trees); names like <em>“Central-Mid-Levels Escalator”</em> are auto-detected as covered.</p>
+  <h3>Route objectives</h3>
+  <ul>
+    <li><strong>Fastest</strong> — minimise the API's walking time.</li>
+    <li><strong>Coolest</strong> — minimise cumulative heat cost.</li>
+    <li><strong>Balanced</strong> — time × (1 + λ·heat), λ grows with your heat-sensitivity setting.</li>
+  </ul>
+  <h3>Shade model</h3>
+  <p>NOAA solar position for the departure time; the sunward-side building casts a shadow band <code>H / tan(elevation)</code> across the street width; tree canopy and covered walkways (escalator, elevated walkway) add shade on top.</p>
+  <h3>Data sources &amp; licences (prototype → production path)</h3>
+  <ul>
+    <li>Routing: OSRM foot demo server, OSM data (ODbL, fair-use demo) → self-hosted Valhalla or LandsD 3D Pedestrian Route Search API. Google Directions could also be plugged in, but requires a paid API key.</li>
+    <li>Weather: Open-Meteo (free non-commercial tier) → HKO / DATA.GOV.HK.</li>
+    <li>Buildings / trees: Central canyon table (demo values) → LandsD/CSDI building heights + tree datasets.</li>
+    <li>Basemap: CARTO Voyager (© OpenStreetMap contributors, © CARTO).</li>
+    <li>Thermal model upgrade path: pvlib + pybdshadow + pythermalcomfort (MRT / PET / UTCI).</li>
+  </ul>
+  <h3>Designed failure modes</h3>
+  <p>Routing API down → built-in simulated pilot network with an on-screen notice. Weather API down → stale-data warning + cached snapshot. No shadow data → sun-exposure proxy. Low model confidence → wording downgraded to “lower estimated heat exposure”. Rate limits → cache / self-host.</p>
+  <form method="dialog"><button class="ghost wide">Close</button></form>
+</dialog>
+
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="data.js"></script>
+<script src="engine.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
