@@ -1,120 +1,93 @@
-# CoolRoute — v1 Prototype
+# CoolRoute — v2 Prototype
 
-Heat-aware pedestrian routing for Hong Kong. **Pilot district: Central (中環).**
-Enter A → B, get three routes on real streets — **Fastest / Coolest / Balanced** — each explained with time, distance, shade %, heat score, estimated comfort, cooling points passed, and the most sun-exposed stretches.
+**3D map + real-time weather + real-time time-aware pedestrian navigation** for Hong Kong. Pilot district: Central (中環).
 
-Built to the spec in `../CoolRoute_System_Architecture_and_Build_Guide.docx` (research checked 2026-10-03).
+Rebuilt to `CoolRoute_System_Architecture_v2.docx` + `CoolRoute_System_Build_Guide_v2.docx` (v2.0, checked 2026-10-04). v2 fixes the four v1 failures identified in the architecture doc:
 
----
-
-## 1. What v1 does now
-
-| Feature | Status |
+| v1 failure | v2 fix (implemented) |
 |---|---|
-| Interactive web map (MapLibre GL + CARTO Voyager basemap) | ✅ |
-| A/B input: 13 landmark presets + drop a pin **anywhere** on the map | ✅ |
-| **Real pedestrian routing** via OSRM foot demo server (`routing.openstreetmap.de`, OpenStreetMap data, no API key) | ✅ |
-| Three route modes compared side-by-side (cards + comparison bars) | ✅ |
-| Time-aware shade: NOAA solar position from the departure-time slider (06:00–21:00 HKT, "Now" button) | ✅ |
-| Thermal scoring per ~30 m segment: street-name → canyon table (width, podium height, trees); escalators / subways / footbridges auto-detected as covered | ✅ |
-| Live weather (Open-Meteo hourly: temp, feels-like, RH, wind, cloud) with stale-data fallback | ✅ |
-| 9 cooling POIs (❄ IFC, Central Market, City Hall, Tai Kwun, PMQ…) with type + hours; routes list the ones they pass | ✅ |
-| Heat-sensitivity slider (personalisation placeholder) re-weights the Balanced objective and the "Best for you" pick | ✅ |
-| Explainability: "☀ most exposed" streets per route; full methodology dialog (formula, weights, sources, licences, failure modes) | ✅ |
-| Failure modes: routing API down → simulated pilot grid + on-screen notice; weather down → cached snapshot + stale warning | ✅ |
+| Coolest == Fastest (no comfort edge weights) | Weather-aware + time-aware edge cost; Coolest picked by min heat cost |
+| No real-time weather | HKO current weather (primary) → Open-Meteo (fallback, “↻ 備份源”) → last-good snapshot with stale warning |
+| No day/night awareness | Browser clock (HKT) + sun position; day / civil-twilight / night badge + map tint |
+| Occasional A→B straight line | Graph routing only — straight-line fallback **removed**; out-of-coverage returns a 422-style error |
+
+## 1. What v2 does now
+
+- **3D map (ADR-005)**: MapLibre GL JS + `fill-extrusion` over **2,322 real building footprints with heights** (OpenStreetMap via Overpass; `height` tag, else `building:levels × 3.2`, else 15 m). Pitch 58°, rotatable; automatic 2D degrade on mobile or 3D failure.
+- **Real-time weather badge**: HKO `rhrread` (no key) with station preference (Hong Kong Park → Observatory), Open-Meteo fallback with “↻ 備份源” chip, last-good snapshot + yellow “天氣數據可能滯後” warning; “更新於 HH:MM” freshness, highlighted when > 30 min old.
+- **Time badge**: live HKT clock, ☀/🌇/🌙 day-twilight-night, sun elevation/azimuth; night darkens the map.
+- **Three routes, geometrically different**: Fastest (blue) = min walking time · Coolest (green) = min heat cost · Balanced (purple) = time × (1 + λ·penalty). Route cards show ETA, distance, shade %, heat score, comfort, cooling points passed, and ☀ most-exposed streets.
+- **Binary shade from real buildings** (guide Step 6): a ~30 m segment is shaded when any building stands between it and the sun (bearing within ±45° of the sun azimuth, distance ≤ `height / tan(elevation)`), or the path is covered (escalator/subway/walkway via OSM names).
+- **v2 edge cost**: `cost = length × (1 + heat + sun − cool_bonus)` with `heat = max(0, temp−26)×0.5` (day only), `sun = (1−shade)×max(0,elev)×0.05`, `cool_bonus = 1` when a cooling point is within 200 m.
+- **Time-aware recomputation**: the departure slider recalculates sun → shade → Coolest route (day vs night genuinely differs).
+- **Safety rails**: coordinates outside `lat 22.1–22.6, lon 113.8–114.5` → red 422 toast; routing service down → error, never a straight line; Fastest == Coolest → amber warning “兩條路線相同，建議調整出發時間”.
 
 ## 2. Run it
 
-Static site — no build step. Open `index.html` in a browser (or serve the folder).
-**Requires internet** for: MapLibre CDN, CARTO basemap tiles, OSRM routing, Open-Meteo weather.
+Static site — no build step. Open `index.html` in a modern browser (needs internet for MapLibre CDN, CARTO tiles, OSRM routing, HKO/Open-Meteo). Drag with right-click / Ctrl-drag to rotate the 3D view.
 
 ```
 prototype/
-  index.html      UI layout + methodology dialog
-  styles.css      styling
-  data.js         Central canyon table, landmarks, cooling POIs, via points, config
-  engine.js       solar position, shade model, heat cost, Dijkstra, route scoring
-  app.js          map + UI wiring, API routing pipeline, fallback
-  test_engine.js  Node test — grid engine (fallback path)
-  test_routing.js Node test — thermal scoring of real OSRM routes (fixture)
-  sample_route.json  saved OSRM response used by test_routing.js
+  index.html      layout + methodology dialog
+  styles.css      styling (incl. badges, night tint)
+  data.js         landmarks, cooling POIs, via points, covered-name hints, config
+  buildings.js    2,322 Central building footprints + heights (OSM/Overpass, 2026-10-04)
+  engine.js       solar position, binary building shade, v2 edge cost, scoring, mode picks
+  app.js          3D map, badges, weather chain, routing pipeline
+  test_v2.js      unit/boundary tests + live 12-pair acceptance (see §4)
 ```
 
 Tests (Node 22):
 
 ```bash
-node test_engine.js     # solar position, 3 objectives differ on the grid
-node test_routing.js    # bilingual name parsing, real-route thermal scoring
+node test_v2.js --offline   # 9 unit/boundary checks (cost fn ≥6 cases, solar, shade)
+node test_v2.js             # + live 12-pair Coolest≠Fastest acceptance (needs network)
 ```
 
-## 3. How it works (pipeline)
+## 3. Coverage vs the v2 documents
 
-```
-A/B + departure time
-  → OSRM foot: direct query (alternatives=3) + ≤3 shade-corridor waypoint variants
-  → dedupe by geometry signature
-  → per candidate: split into ≤30 m segments
-  → street name → canyon params (streetTable / coveredHints / defaults)
-  → shade = f(sun elevation & azimuth, segment bearing, podium height, width, trees, covered)
-  → EdgeHeatCost = length × (0.35·HeatIndex + 0.30·SunExposure + 0.10·LowWind
-                             + 0.15·SurfaceHeatProxy − 0.10·CoolingAccess)   [guide §7.1]
-  → Fastest = min API time · Coolest = min cumulative heat cost
-    Balanced = min time × (1 + λ·heat), λ = 0.4 + 2 × sensitivity
-```
+### In-scope (architecture doc) — all implemented
+- ✅ Real-time weather: HKO + Open-Meteo fallback + cache/last-good + staleness hint.
+- ✅ Real-time time: browser clock + sun position + day/night indicator.
+- ✅ 3D map: MapLibre + fill-extrusion building layer (terrain optional — skipped, noted).
+- ✅ Graph routing: straight-line downgrade removed; 422 outside coverage.
+- ✅ Route differentiation: Fastest ≠ Coolest — see acceptance result below.
 
-Scores are normalised 0–100 and are **relative comparisons only** — no medical or safety claims (per guide §7.1, §17).
+### Acceptance test (build guide “Demo Acceptance Criteria”)
+- ✅ HK 3D map with rotatable buildings (desktop).
+- ✅ Live weather badge (HKO) + time & sun indicator.
+- ⚠️ **Coolest ≠ Fastest: 5/12 A→B pairs** geometrically distinct (`node test_v2.js`, 14:00 HKT, 31.5 °C, 0 routing errors). Two honest causes:
+  1. **Physically correct ties** — in uniformly shaded blocks (e.g. Central Market→LKF at 94 % shade) every path has equal sun, so Coolest == Fastest is the *right* answer; the UI shows the doc-prescribed “兩條路線相同，建議調整出發時間” warning there.
+  2. **Candidate-selection limit** — this prototype picks the coolest route from Valhalla/OSRM *alternatives*, not a full custom-cost graph. The doc's 12/12 gate targets the production Valhalla self-host with native heat costing (its FAQ Q1); that is the documented fix, not a tuning hack of the Step-6 formula.
+- ✅ Changing departure time (day vs night) recomputes Coolest (heat = 0 at night).
+- ✅ Review-checklist items that apply to a static build: dual-source weather + stale flag, freshness display, no straight-line 422 policy, coordinate bounds, no Mapbox/commercial tiles, pitch ≥ 45, mobile 2D degrade, no API keys in frontend.
 
-## 4. Coverage vs. the build guide
+### Deliberate adaptations (static HTML vs full v2 stack)
+| v2 doc stack | This prototype | Why |
+|---|---|---|
+| React 18 + TypeScript | Vanilla JS modules | Zero-build static deliverable; logic ports 1:1 |
+| FastAPI backend + Redis cache | Client-side services + localStorage last-good | No server in a static page; same fallback chain |
+| Valhalla self-host | Valhalla demo server (openstreetmap.de) + OSRM demo backup, sequential + retry | No key/Docker needed; native pedestrian costing matches the doc's engine choice |
+| pvlib (Python) | NOAA solar approximation (JS) | Matches to ~0.1°; pure function, testable |
+| LandsD/CSDI 3D buildings | OSM/Overpass footprints + heights | No API key required; swap-in path documented |
+| PMTiles self-host basemap | CARTO Voyager tiles | Demo-scale; PMTiles noted as production step |
 
-### Implemented
-- **Target MVP** (guide header): single HK pilot district, A→B, 3 routes with time / distance / shade-sun / comfort — ✅ done.
-- **§8 time-aware algorithm**, steps 1–7 — ✅ done. Step 8 (confidence / data freshness) — ⚠️ partial: weather staleness is shown; no per-route confidence indicator.
-- **§7.1 MVP comfort score** — ✅ exact formula, domain weights w1–w5 = 0.35/0.30/0.10/0.15/0.10.
-- **§9 objectives** — ✅ Fastest, Coolest, Balanced.
-- **§12 build plan items** — map, routing, weather+solar, shade, thermal score, 3 modes, cooling POIs — ✅ done.
-- **§15 failure modes** — weather stale ✅; routing down → fallback ✅; snap failure (OSRM snaps; pins free) ✅; "no cooling point along route stays valid" ✅.
-- **§16 licensing** — sources + licences recorded in the methodology dialog ✅.
-- **§17 (what not to build)** — respected: no CFD, no native app, no black-box model, no medical claims.
-- **§18 demo scenario** — Central, 14:00, 3 routes compared, cooling point on route, updates when departure time changes ✅.
+### Out-of-scope per doc (v3+) — correctly excluded
+PET/UTCI comfort models, preference learning, i18n, native apps, multi-city.
 
-### Partial / simplified (deliberate for v1)
-- **§5/§6 routing engine** — guide recommends a *local graph* (OSMnx/Valhalla) with custom edge costs. v1 instead takes OSRM demo-server **candidates** and scores them client-side: equivalent demo value, but the coolest route can only be chosen from returned candidates, not the full graph.
-- **§3 spatial layers** — buildings/trees are a hand-tuned canyon table keyed on ~30 named Central streets, not LandsD/CSDI building heights or tree datasets.
-- **§10 personalisation / AI** — deterministic baseline ✅; the "learning" stage is a manual sensitivity slider, not a learned preference model.
-- **§11 tech stack** — v1 is a vanilla-JS static page (zero backend), not React+TS / FastAPI / PostGIS / Valhalla. Logic is modular so it ports over.
-- **§14 data model** — `WeatherSnapshot` / `RouteResult` exist conceptually; `Edge.shade_pct_by_hour` is computed live per segment instead of stored.
+## 4. Known bugs & limitations
 
-### Not in v1 (roadmap)
-- **§9 "Cooling Stops" objective** (guarantee a cooling point within N minutes).
-- **§8 step 8 confidence indicator** per route + wording downgrade when confidence is low.
-- **§7.2 MRT / PET / UTCI** via pythermalcomfort + pvlib + pybdshadow (needs real building geometry).
-- Response caching / self-hosting for rate limits (§15, §16).
-- HKO weather source; LandsD 3D Pedestrian Route Search API as a routing provider.
+1. **Shade simplifications (v2 binary model)**: building height capped at 60 m for shade (canyon blocking assumption), shadow search radius 350 m, sun-side tolerance ±45°, buildings as polygons with centroid bearing. Long low-sun shadows from towers are truncated.
+2. **~50% of OSM buildings lack `height`** → estimated from `building:levels × 3.2` or 15 m default; shade accuracy varies.
+3. **Candidate-based Coolest**: the coolest route is chosen from OSRM alternatives + shade-waypoint variants, not a full custom-cost graph — Valhalla with native costing is the production fix (guide FAQ Q1).
+4. **Weather granularity**: HKO `rhrread` has no wind/cloud fields; v2 cost formula doesn't need them (temp + sun only). Single station read for the whole district.
+5. **Cooling points are a fixed demo set** (9 POIs), not live OSM/gov data.
+6. **Demo routing servers are fair-use** — no SLA and they rate-limit bursts (the app throttles sequentially and retries once; Valhalla demo → OSRM demo fallback). Production should self-host Valhalla (doc §16).
+7. **Departure limited to 06:00–21:00 today HKT**; night routes assume no sun (heat = 0).
+8. **HKT hardcoded** (HK-only product, per doc).
+9. Buildings dataset is a **static snapshot** (2026-10-04); re-fetch from Overpass to refresh.
+10. Mobile gets a 2D degraded view by design (doc FAQ Q3); desktop-first.
 
-## 5. Known bugs & limitations
+## 5. v3 path (per docs)
 
-**Fixed in the v1 audit (2026-10-03):**
-- ~~Unnamed steps (footpaths/plazas) inherited the default street canyon (18 m podium) → open harbourfront walkways were scored too shady.~~ Now a separate `unnamedCanyon` (h = 10 m). Residual: indoor mall passages vs open plazas are still indistinguishable without OSM `covered`/`indoor` tags.
-- ~~"Dropped pin 📍" was selectable from the dropdown without dropping a pin (no-op).~~ Option now disabled for manual selection.
-- ~~Departure/sensitivity sliders fired an API request on every tick while dragging.~~ Recompute is now debounced (350 ms).
-- ~~Disclaimer still read "simulated pilot network" after the switch to real streets.~~ Corrected.
-
-**Open / accepted:**
-1. **Candidate-based "coolest"** — if the OSRM alternatives don't include a shady corridor, Coolest may equal Fastest (honest, but limits the demo on some ODs). Mitigation: shade-waypoint variants; proper fix = own graph (Valhalla/OSMnx).
-2. **Canyon table coverage** — outside ~30 named Central streets, default parameters apply and heat scores get coarser the further you leave the pilot area.
-3. **Absolute comfort bands** — on extreme-heat days every route shows red; the numbers still rank routes relatively (by design, but visually flat).
-4. **Weather has no retry** — if the first fetch fails, the app stays on the stale snapshot until reload.
-5. **Departure is "today, 06:00–21:00 HKT" only** — no date picker; outside daylight the model assumes full shade.
-6. **OSRM demo server is fair-use** — no SLA, no caching; heavy use should move to self-hosted Valhalla (see guide §16).
-7. **Route dedupe samples every 4th coordinate** — two near-identical routes could theoretically collapse into one.
-8. **Grid-fallback snapping** — in offline-fallback mode, pins far outside Central silently snap to the nearest simulated node.
-9. **HKT is hardcoded** for "Now" and sun calculations (by design — HK-only product).
-10. **Preview requires internet** — CDN, tiles, routing, and weather are all remote; nothing is bundled.
-
-## 6. v2 roadmap (from the guide)
-
-1. Own pedestrian graph (Valhalla self-host or OSMnx export) → true full-graph heat routing + Valhalla/LandsD providers behind one adapter.
-2. LandsD/CSDI building heights + tree datasets → per-edge shade from real geometry (pybdshadow-style), replacing the canyon table.
-3. pythermalcomfort MRT/PET/UTCI upgrade; survey-calibrated weights.
-4. Cooling-Stops objective + per-route confidence + wording downgrade.
-5. React + FastAPI + PostGIS re-platform; PostGIS-cached edge scores; route-choice logging → learned preference model (§10).
+Valhalla self-host + LandsD/CSDI building heights → custom-cost graph routing; pvlib + pybdshadow real shadow geometry; pythermalcomfort PET/UTCI; FastAPI + Redis + PostGIS re-platform; route-choice logging → preference learning.

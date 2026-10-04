@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>CoolRoute v1 — Heat-aware routing · Central, Hong Kong</title>
+<title>CoolRoute v2 — 3D + real-time weather & time-aware routing · Central, Hong Kong</title>
 <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
 <link rel="stylesheet" href="styles.css" />
 </head>
@@ -13,8 +13,8 @@
     <header class="brand">
       <div class="logo">❄</div>
       <div>
-        <h1>CoolRoute</h1>
-        <p class="tagline">Heat-aware routing · Central pilot · v1 prototype</p>
+        <h1>CoolRoute <span class="vtag">v2</span></h1>
+        <p class="tagline">3D map · real-time weather · time-aware routing · Central pilot</p>
       </div>
     </header>
 
@@ -34,17 +34,11 @@
 
     <section class="panel">
       <div class="row-between">
-        <label for="depart">Departure <strong id="depart-label">14:00</strong></label>
+        <label for="depart">Departure <strong id="depart-label">—</strong></label>
         <button class="mini" id="now-btn">Now</button>
       </div>
       <input type="range" id="depart" min="6" max="21" step="0.5" value="14" />
-      <div id="sun-line" class="hint"></div>
-    </section>
-
-    <section class="panel" id="weather-card">
-      <h2>Weather <span id="wx-source" class="badge">…</span></h2>
-      <div id="wx-grid" class="wx-grid"></div>
-      <div id="wx-stale" class="stale hidden">⚠ Weather service unavailable — using last valid snapshot (stale data).</div>
+      <div class="hint">Changing departure time recalculates sun, shade and the Coolest route.</div>
     </section>
 
     <section class="panel">
@@ -62,53 +56,61 @@
 
     <section class="panel legend">
       <h2>Legend</h2>
-      <div class="legend-row"><span class="sw" style="background:#f59e0b"></span>Fastest — real foot path, min time</div>
-      <div class="legend-row"><span class="sw" style="background:#06b6d4"></span>Coolest — min heat exposure</div>
+      <div class="legend-row"><span class="sw" style="background:#2563eb"></span>Fastest — min walking time</div>
+      <div class="legend-row"><span class="sw" style="background:#16a34a"></span>Coolest — min heat cost</div>
       <div class="legend-row"><span class="sw" style="background:#8b5cf6"></span>Balanced — time + heat trade-off</div>
-      <div class="hint" style="margin-top:6px">Routes follow the real OSM pedestrian network (OSRM foot demo server). ❄ = cooling point · click a route line or card to highlight.</div>
+      <div class="hint" style="margin-top:6px">Graph routing on the real OSM pedestrian network (no straight-line fallback). ❄ = cooling point · drag with right-click / Ctrl to rotate the 3D view.</div>
     </section>
 
     <button id="method-btn" class="ghost wide">Methodology, data sources &amp; licences</button>
-    <p class="disclaimer">Prototype: demo thermal estimates on real streets, relative scores only — not a medical or safety guarantee.</p>
+    <p class="disclaimer">Prototype: demo thermal estimates, relative scores only — not a medical or safety guarantee.</p>
   </aside>
 
   <main id="map-wrap">
     <div id="map"></div>
+    <div id="night-tint"></div>
+    <div class="map-badges">
+      <div id="time-badge" class="badge-chip">…</div>
+      <div id="weather-badge" class="badge-chip">…</div>
+      <div id="wx-stale" class="stale hidden">⚠ 天氣數據可能滯後 — weather data may be outdated.</div>
+    </div>
     <div id="banner" class="hidden"></div>
   </main>
 </div>
 
 <dialog id="method-dialog">
-  <h2>How CoolRoute v1 works</h2>
-  <p>Deterministic, explainable baseline (per the system architecture guide): sun position → street-canyon shade → edge heat cost → three routing objectives.</p>
-  <h3>Edge heat cost</h3>
-  <code>EdgeHeatCost = length × (w1·HeatIndex + w2·SunExposure + w3·LowWind + w4·SurfaceHeatProxy − w5·CoolingAccess)</code>
-  <p class="hint">w1&nbsp;=&nbsp;0.35, w2&nbsp;=&nbsp;0.30, w3&nbsp;=&nbsp;0.10, w4&nbsp;=&nbsp;0.15, w5&nbsp;=&nbsp;0.10 — initial domain weights, to be calibrated with pilot survey data. Scores are normalised 0–100 and used <em>only</em> for relative route comparison.</p>
-  <h3>Routing (real streets)</h3>
-  <p>Route candidates come from an <strong>OSRM foot-profile demo server</strong> (routing.openstreetmap.de, OpenStreetMap data, no API key): the direct query plus its alternatives and a few shade-corridor waypoint variants are deduplicated, then each candidate is scored thermally per ~30 m segment. Each segment's street name (from the API) maps to a Central canyon table (width, podium height, trees); names like <em>“Central-Mid-Levels Escalator”</em> are auto-detected as covered.</p>
-  <h3>Route objectives</h3>
+  <h2>How CoolRoute v2 works</h2>
+  <p>v2 fixes the four v1 failures from the architecture doc: identical routes → weather/time-aware edge costs; no live weather → HKO dual-source; no day/night → browser clock + sun position; straight-line artefacts → graph routing only, no straight-line fallback.</p>
+  <h3>Edge cost (build guide Step 6)</h3>
+  <code>cost = length × (1 + heat + sun − cool_bonus)<br>
+  heat = max(0, temp°C − 26) × 0.5 (daytime only)<br>
+  sun = (1 − shade) × max(0, sun_elevation) × 0.05<br>
+  cool_bonus = 1 if a cooling point is within 200 m</code>
+  <h3>Binary shade from real buildings</h3>
+  <p>2,322 real building footprints + heights (OpenStreetMap via Overpass). A segment is shaded (1) when any building stands between it and the sun — bearing within ±45° of the sun azimuth and within the building's shadow length <code>height / tan(elevation)</code> — or when the path is covered (escalator / subway / walkway, detected from OSM names). Otherwise sunny (0). v2 deliberately uses 0/1 shade; fine-grained PET/UTCI is v3+.</p>
+  <h3>Routing (graph only)</h3>
+  <p>Real pedestrian geometry from an OSRM foot-profile demo server (OSM data): direct query with alternatives plus shade-corridor waypoint variants, deduplicated, then scored per ~30 m segment. If A or B falls outside Hong Kong coverage (lat 22.1–22.6, lon 113.8–114.5) the app returns a 422-style error — <em>never</em> a straight line. Production path: self-hosted Valhalla / LandsD 3D pedestrian network.</p>
+  <h3>Weather &amp; time</h3>
   <ul>
-    <li><strong>Fastest</strong> — minimise the API's walking time.</li>
-    <li><strong>Coolest</strong> — minimise cumulative heat cost.</li>
-    <li><strong>Balanced</strong> — time × (1 + λ·heat), λ grows with your heat-sensitivity setting.</li>
+    <li>Weather: HKO current weather (data.weather.gov.hk, no key) → Open-Meteo fallback (“↻ 備份源”) → last-good snapshot with stale warning. “更新於” shows data time; over 30 min is highlighted.</li>
+    <li>Time: browser clock in HKT + NOAA/pvlib-equivalent sun position; day / civil-twilight / night shown in the badge and as a map tint.</li>
+    <li>Routes: Fastest = min walking time · Coolest = min heat cost · Balanced = time × (1 + λ·heat penalty), λ from heat sensitivity.</li>
   </ul>
-  <h3>Shade model</h3>
-  <p>NOAA solar position for the departure time; the sunward-side building casts a shadow band <code>H / tan(elevation)</code> across the street width; tree canopy and covered walkways (escalator, elevated walkway) add shade on top.</p>
-  <h3>Data sources &amp; licences (prototype → production path)</h3>
+  <h3>Data sources &amp; licences</h3>
   <ul>
-    <li>Routing: OSRM foot demo server, OSM data (ODbL, fair-use demo) → self-hosted Valhalla or LandsD 3D Pedestrian Route Search API. Google Directions could also be plugged in, but requires a paid API key.</li>
-    <li>Weather: Open-Meteo (free non-commercial tier) → HKO / DATA.GOV.HK.</li>
-    <li>Buildings / trees: Central canyon table (demo values) → LandsD/CSDI building heights + tree datasets.</li>
-    <li>Basemap: CARTO Voyager (© OpenStreetMap contributors, © CARTO).</li>
-    <li>Thermal model upgrade path: pvlib + pybdshadow + pythermalcomfort (MRT / PET / UTCI).</li>
+    <li>Routing: OSRM foot demo server, OSM data (ODbL, fair-use demo) → Valhalla self-host / LandsD API.</li>
+    <li>Buildings: OpenStreetMap via Overpass (ODbL) → LandsD/CSDI 3D Spatial Data (free key on request).</li>
+    <li>Weather: HKO open data (data.gov.hk terms) + Open-Meteo (free non-commercial tier).</li>
+    <li>Basemap: CARTO Voyager (© OpenStreetMap contributors, © CARTO). No Mapbox tokens anywhere.</li>
   </ul>
   <h3>Designed failure modes</h3>
-  <p>Routing API down → built-in simulated pilot network with an on-screen notice. Weather API down → stale-data warning + cached snapshot. No shadow data → sun-exposure proxy. Low model confidence → wording downgraded to “lower estimated heat exposure”. Rate limits → cache / self-host.</p>
+  <p>HKO down → Open-Meteo badge. All weather down → stale snapshot + yellow warning. A/B outside coverage → red 422 toast. 3D layer fails (or mobile) → automatic 2D degrade. Coolest = Fastest → amber warning suggesting a different departure time.</p>
   <form method="dialog"><button class="ghost wide">Close</button></form>
 </dialog>
 
 <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 <script src="data.js"></script>
+<script src="buildings.js"></script>
 <script src="engine.js"></script>
 <script src="app.js"></script>
 </body>

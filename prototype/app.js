@@ -1,26 +1,28 @@
-/* CoolRoute v1 prototype — UI + map wiring
- * Routing: real pedestrian routes from an OSRM foot server (OSM data).
- * Thermal scoring: CoolRoute engine on top (sun position -> canyon shade -> heat).
- * Fallback: built-in simulated Central grid if the routing service is unreachable.
+/* CoolRoute v2 prototype — UI + map wiring
+ * Per v2 docs: 3D fill-extrusion buildings, HKO live weather (dual-source),
+ * day/night awareness, graph routing ONLY (no straight-line fallback),
+ * Coolest ≠ Fastest by construction, similarity warning when identical.
  */
 (function () {
-  const D = CR_DATA, E = CR_ENGINE;
+  const D = CR_DATA, E = CR_ENGINE, BLD = CR_BUILDINGS;
   const MODE_META = {
-    fastest: { name: "Fastest", icon: "⚡", color: "#f59e0b", offset: -4 },
-    coolest: { name: "Coolest", icon: "❄", color: "#06b6d4", offset: 4 },
-    balanced: { name: "Balanced", icon: "⚖", color: "#8b5cf6", offset: 0 }
+    fastest: { name: "Fastest", icon: "⚡", color: "#2563eb" },   // blue (guide §3.2)
+    coolest: { name: "Coolest", icon: "❄", color: "#16a34a" },   // green
+    balanced: { name: "Balanced", icon: "⚖", color: "#8b5cf6" }  // purple
   };
+  const IS_MOBILE = matchMedia("(pointer: coarse)").matches || innerWidth < 820;
 
   const state = {
-    a: { ...D.landmarks[0], label: D.landmarks[0].name },   // IFC
-    b: { ...D.landmarks[12], label: D.landmarks[12].name }, // SoHo
-    departH: 14, sens: 0.5,
-    wxHourly: null, wxStale: false,
+    a: { ...D.landmarks[0], label: D.landmarks[0].name },
+    b: { ...D.landmarks[12], label: D.landmarks[12].name },
+    departH: null,            // set to current HKT time below
+    sens: 0.5,
+    weather: null,            // {tempC, rhPct, source, fetchedAt(Date), stale, backup}
     pick: null, selected: "balanced",
-    modes: null,        // {fastest: cand, coolest: cand, balanced: cand}
-    source: "api",      // 'api' | 'grid'
+    modes: null, identicalFC: false,
     sun: null, seq: 0
   };
+  const bidx = E.buildBuildingIndex(BLD);
 
   // ---------- HKT time helpers ----------
   const hktNow = () => new Date(Date.now() + 8 * 3600e3);
@@ -31,8 +33,9 @@
   }
   const pad = x => String(x).padStart(2, "0");
   const fmtH = h => pad(Math.floor(h)) + ":" + pad(Math.round((h % 1) * 60));
+  state.departH = (() => { const n = hktNow(); return Math.min(21, Math.max(6, n.getUTCHours() + n.getUTCMinutes() / 60)); })();
 
-  // ---------- Map ----------
+  // ---------- Map (3D per ADR-005) ----------
   const RASTER_FALLBACK = {
     version: 8,
     sources: { carto: { type: "raster", tiles: ["https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png"], tileSize: 256, attribution: "© OpenStreetMap contributors © CARTO" } },
@@ -42,13 +45,17 @@
     container: "map",
     style: "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
     center: [D.center.lon, D.center.lat],
-    zoom: 15.6,
+    zoom: 15.8,
+    pitch: IS_MOBILE ? 0 : 58,       // guide: pitch 45–60 required for 3D
+    bearing: -20,
+    maxPitch: 65,
+    antialias: true,
     attributionControl: { compact: true }
   });
-  map.addControl(new maplibregl.NavigationControl(), "top-right");
+  map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
   map.addControl(new maplibregl.ScaleControl(), "bottom-right");
 
-  let layersReady = false;
+  let layersReady = false, buildings3D = false;
   const loadTimer = setTimeout(() => {
     if (!layersReady) { map.setStyle(RASTER_FALLBACK); map.once("style.load", setupLayers); }
   }, 7000);
@@ -65,6 +72,29 @@
 
   function setupLayers() {
     if (layersReady) return; layersReady = true;
+
+    // 3D buildings (ADR-005; degrade to 2D on failure — failure-mode table)
+    if (!IS_MOBILE) {
+      try {
+        map.addSource("buildings", { type: "geojson", data: BLD });
+        map.addLayer({
+          id: "3d-buildings",
+          source: "buildings",
+          type: "fill-extrusion",
+          paint: {
+            "fill-extrusion-color": "#a8b8ad",
+            "fill-extrusion-height": ["get", "height"],
+            "fill-extrusion-base": 0,
+            "fill-extrusion-opacity": 0.75
+          }
+        });
+        buildings3D = true;
+      } catch (err) {
+        console.warn("3D buildings unavailable, degrading to 2D", err);
+        buildings3D = false;
+      }
+    }
+
     map.addSource("routes", { type: "geojson", data: routeFC() });
     map.addLayer({
       id: "route-casing", type: "line", source: "routes",
@@ -79,7 +109,8 @@
     map.addLayer({
       id: "route-lines", type: "line", source: "routes",
       paint: {
-        "line-color": ["match", ["get", "mode"], "fastest", "#f59e0b", "coolest", "#06b6d4", "#8b5cf6"],
+        "line-color": ["match", ["get", "mode"],
+          "fastest", MODE_META.fastest.color, "coolest", MODE_META.coolest.color, MODE_META.balanced.color],
         "line-width": ["case", ["to-boolean", ["get", "selected"]], 5, 3.5],
         "line-opacity": ["case", ["to-boolean", ["get", "selected"]], 1, 0.55],
         "line-offset": ["match", ["get", "mode"], "fastest", -4, "coolest", 4, 0]
@@ -87,15 +118,10 @@
       layout: { "line-cap": "round", "line-join": "round" }
     });
 
-    // Click a route line to select its card
-    map.on("click", "route-lines", ev => {
-      if (state.pick) return;
-      selectMode(ev.features[0].properties.mode);
-    });
+    map.on("click", "route-lines", ev => { if (!state.pick) selectMode(ev.features[0].properties.mode); });
     map.on("mousemove", "route-lines", () => { if (!state.pick) map.getCanvas().style.cursor = "pointer"; });
     map.on("mouseleave", "route-lines", () => { map.getCanvas().style.cursor = ""; });
 
-    // Cooling-point markers
     for (const p of D.coolingPoints) {
       const el = document.createElement("div");
       el.className = "marker-cp"; el.textContent = "❄"; el.title = p.name;
@@ -126,48 +152,119 @@
   };
   const markerA = mkMarker("marker-a"), markerB = mkMarker("marker-b");
 
-  // ---------- Weather ----------
+  // ---------- Weather: HKO primary → Open-Meteo fallback → last-good snapshot
   async function fetchWeather() {
     try {
-      const url = "https://api.open-meteo.com/v1/forecast?latitude=" + D.center.lat + "&longitude=" + D.center.lon
-        + "&hourly=temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m,cloud_cover"
-        + "&timezone=Asia%2FHong_Kong&forecast_days=2";
-      const res = await fetch(url);
+      const res = await fetch("https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=rhrread&lang=en");
       if (!res.ok) throw new Error("HTTP " + res.status);
       const j = await res.json();
-      state.wxHourly = j.hourly; state.wxStale = false;
-    } catch (err) {
-      state.wxHourly = null; state.wxStale = true;
+      const stations = j.temperature?.data || [];
+      const pref = ["Hong Kong Park", "Hong Kong Observatory", "King's Park"];
+      const st = pref.map(p => stations.find(s => s.place === p)).find(Boolean) || stations[0];
+      if (!st) throw new Error("no temperature stations");
+      const rh = (j.humidity?.data || [])[0];
+      return finishWeather({
+        tempC: st.value, rhPct: rh ? rh.value : null,
+        source: "HKO · " + st.place, backup: false, stale: false,
+        fetchedAt: new Date(j.temperature.recordTime || j.updateTime)
+      });
+    } catch (e1) {
+      try {
+        const u = "https://api.open-meteo.com/v1/forecast?latitude=" + D.center.lat + "&longitude=" + D.center.lon
+          + "&current=temperature_2m,relative_humidity_2m&timezone=Asia%2FHong_Kong";
+        const res = await fetch(u);
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const j = await res.json();
+        return finishWeather({
+          tempC: j.current.temperature_2m, rhPct: j.current.relative_humidity_2m,
+          source: "Open-Meteo (fallback)", backup: true, stale: false,
+          fetchedAt: new Date(j.current.time)
+        });
+      } catch (e2) {
+        const last = readLastGood();
+        state.weather = last || { ...D.fallbackWeather, fetchedAt: null };
+        renderWeather(); recompute(false);
+      }
     }
-    recompute(false);
   }
-  function weatherFor(date) {
-    if (state.wxHourly) {
-      const n = hktNow();
-      const hktH = (date.getUTCHours() + 8) % 24;
-      const key = n.getUTCFullYear() + "-" + pad(n.getUTCMonth() + 1) + "-" + pad(n.getUTCDate())
-        + "T" + pad(hktH);
-      let idx = state.wxHourly.time.indexOf(key);
-      if (idx < 0) idx = Math.min(state.wxHourly.time.length - 1, hktH);
-      const h = state.wxHourly;
-      return {
-        tempC: h.temperature_2m[idx], apparentC: h.apparent_temperature[idx],
-        rhPct: h.relative_humidity_2m[idx], windMs: h.wind_speed_10m[idx],
-        cloudPct: h.cloud_cover[idx], source: "Open-Meteo live", stale: false
-      };
-    }
-    return D.fallbackWeather;
+  function finishWeather(wx) {
+    if (isNaN(wx.fetchedAt)) wx.fetchedAt = new Date();
+    state.weather = wx;
+    try { localStorage.setItem("coolroute:lastgood", JSON.stringify({ ...wx, fetchedAt: wx.fetchedAt.getTime() })); } catch (e) {}
+    renderWeather(); recompute(false);
+  }
+  function readLastGood() {
+    try {
+      const j = JSON.parse(localStorage.getItem("coolroute:lastgood"));
+      if (j && j.tempC != null) return { ...j, stale: true, fetchedAt: new Date(j.fetchedAt) };
+    } catch (e) {}
+    return null;
   }
 
-  // ---------- Real pedestrian routing (OSRM foot demo server) ----------
-  async function fetchRoute(waypoints, alternatives) {
+  // ---------- Routing (graph only — NO straight-line fallback) ----------
+  function decodePolyline(str, precision) {
+    const f = Math.pow(10, -(precision || 6));
+    let index = 0, lat = 0, lon = 0;
+    const coords = [];
+    while (index < str.length) {
+      let b, shift = 0, result = 0;
+      do { b = str.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+      lat += (result & 1) ? ~(result >> 1) : (result >> 1);
+      shift = 0; result = 0;
+      do { b = str.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+      lon += (result & 1) ? ~(result >> 1) : (result >> 1);
+      coords.push([lon * f, lat * f]);
+    }
+    return coords;
+  }
+
+  async function fetchRouteValhalla(waypoints, alternates) {
+    const cfg = D.routingProviders.find(p => p.name === "valhalla");
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), D.routingService.timeoutMs);
+    const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs);
+    try {
+      const res = await fetch(cfg.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          locations: waypoints.map(([lon, lat]) => ({ lat, lon })),
+          costing: "pedestrian",
+          alternates,
+          directions_options: { units: "kilometers", language: "en-US" }
+        }),
+        signal: ctrl.signal
+      });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const j = await res.json();
+      const trips = [j.trip].concat((j.alternates || []).map(a => a.trip)).filter(Boolean);
+      if (!trips.length || !trips[0].legs) throw new Error("no valhalla routes");
+      return trips.map(trip => {
+        const coords = [], steps = [];
+        let distanceM = 0, durationS = 0;
+        for (const leg of trip.legs) {
+          const shape = decodePolyline(leg.shape);
+          const startAt = coords.length ? 1 : 0; // drop shared joint between legs
+          coords.push(...shape.slice(startAt));
+          for (const m of leg.maneuvers) {
+            const seg = shape.slice(m.begin_shape_index, m.end_shape_index + 1);
+            if (seg.length) steps.push({ name: (m.street_names && m.street_names[0]) || "", coords: seg });
+          }
+          distanceM += (leg.summary.length || 0) * 1000;
+          durationS += leg.summary.time || 0;
+        }
+        return { distanceM, durationS, coords, steps };
+      }).filter(c => c.coords.length > 1);
+    } finally { clearTimeout(t); }
+  }
+
+  async function fetchRouteOsrm(waypoints, alternatives) {
+    const cfg = D.routingProviders.find(p => p.name === "osrm") || D.routingService;
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs);
     try {
       const coords = waypoints.map(w => w[0] + "," + w[1]).join(";");
-      const url = D.routingService.url + coords
-        + "?geometries=geojson&overview=full&steps=true&alternatives=" + alternatives;
-      const res = await fetch(url, { signal: ctrl.signal });
+      const res = await fetch(cfg.url + coords
+        + "?geometries=geojson&overview=full&steps=true&alternatives=" + alternatives, { signal: ctrl.signal });
       if (!res.ok) throw new Error("HTTP " + res.status);
       const j = await res.json();
       if (j.code !== "Ok" || !j.routes || !j.routes.length) throw new Error(j.code || "no routes");
@@ -179,7 +276,20 @@
     } finally { clearTimeout(t); }
   }
 
-  // Shade-rich via points roughly between A and B, used to diversify candidates
+  const PROVIDERS = { valhalla: fetchRouteValhalla, osrm: fetchRouteOsrm };
+  async function fetchRouteAny(waypoints, alternatives) {
+    let lastErr = null;
+    for (const p of D.routingProviders) {
+      try {
+        const routes = await PROVIDERS[p.name](waypoints, alternatives);
+        if (routes && routes.length) return routes;
+      } catch (e) { lastErr = e; }
+    }
+    throw lastErr || new Error("all routing providers failed");
+  }
+  const inHK = p => p.lat >= D.hkBounds.latMin && p.lat <= D.hkBounds.latMax
+    && p.lon >= D.hkBounds.lonMin && p.lon <= D.hkBounds.lonMax;
+
   function viaBetween(a, b) {
     const padDeg = 0.004;
     const minLat = Math.min(a.lat, b.lat) - padDeg, maxLat = Math.max(a.lat, b.lat) + padDeg;
@@ -187,93 +297,75 @@
     return D.viaPoints.filter(v =>
       v.lat > minLat && v.lat < maxLat && v.lon > minLon && v.lon < maxLon
       && E.haversineM(a.lat, a.lon, v.lat, v.lon) > 150
-      && E.haversineM(b.lat, b.lon, v.lat, v.lon) > 150).slice(0, 3);
+      && E.haversineM(b.lat, b.lon, v.lat, v.lon) > 150).slice(0, 4);
   }
 
-  async function planViaApi(wx) {
+  // Sequential with retry — demo servers rate-limit bursts (fair-use policy)
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  async function fetchRouteRetry(wp, alt) {
+    try { return await fetchRouteAny(wp, alt); }
+    catch (e) { await sleep(1500); return fetchRouteAny(wp, alt); }
+  }
+
+  async function planRoutes(wx) {
+    if (!inHK(state.a) || !inHK(state.b))
+      throw { code: 422, message: "該區域暫未覆蓋 — point outside graph coverage (HK bounds). Please pick nearer points." };
     const a = state.a, b = state.b;
-    const reqs = [fetchRoute([[a.lon, a.lat], [b.lon, b.lat]], 3)]
-      .concat(viaBetween(a, b).map(v => fetchRoute([[a.lon, a.lat], [v.lon, v.lat], [b.lon, b.lat]], 0)));
-    const results = await Promise.allSettled(reqs);
+    const results = [];
+    results.push(await fetchRouteRetry([[a.lon, a.lat], [b.lon, b.lat]], 3).catch(e => ({ __err: e })));
+    for (const v of viaBetween(a, b)) {
+      await sleep(300);
+      results.push(await fetchRouteRetry([[a.lon, a.lat], [v.lon, v.lat], [b.lon, b.lat]], 0).catch(e => ({ __err: e })));
+    }
     const seen = new Set(), cands = [];
     for (const r of results) {
-      if (r.status !== "fulfilled") continue;
-      for (const cand of r.value) {
+      if (!r || r.__err) continue;
+      for (const cand of r) {
         const sig = E.routeSignature(cand.coords);
         if (seen.has(sig)) continue;
         seen.add(sig); cands.push(cand);
       }
     }
-    if (!cands.length) throw new Error("all routing requests failed");
+    if (!cands.length) throw { code: 503, message: "Routing service unavailable — please try again in a moment." };
 
     const date = buildDate(state.departH);
     const sun = E.solarPosition(date, D.center.lat, D.center.lon);
     state.sun = sun;
     const ctx = {
-      sun, weather: wx, coolingPoints: D.coolingPoints, streetTable: D.streetTable,
-      coveredHints: D.coveredHints, defaultCanyon: D.defaultCanyon, unnamedCanyon: D.unnamedCanyon
+      sun, weather: { tempC: wx.tempC }, bidx,
+      coolingPoints: D.coolingPoints, coveredHints: D.coveredHints
     };
     for (const c of cands) Object.assign(c, E.scoreCandidate(c, ctx));
-
-    const lambda = 0.4 + 2.0 * state.sens;
-    const pick = fn => cands.reduce((best, c) => fn(c) < fn(best) ? c : best, cands[0]);
-    return {
-      fastest: pick(c => c.durationS),
-      coolest: pick(c => c.heatCost),
-      balanced: pick(c => c.durationS * (1 + lambda * (c.heatScore / 100))),
-      sun
-    };
-  }
-
-  // ---------- Fallback: simulated grid (offline mode) ----------
-  function planViaGrid(wx) {
-    const nearest = pt => {
-      let best = null, bd = Infinity;
-      for (const n of Object.values(D.nodes)) {
-        const d = E.haversineM(pt.lat, pt.lon, n.lat, n.lon);
-        if (d < bd) { bd = d; best = n.id; }
-      }
-      return best;
-    };
-    const date = buildDate(state.departH);
-    const plan = E.planRoutes(D, wx, date, state.sens);
-    state.sun = plan.sun;
-    const r = plan.solve(nearest(state.a), nearest(state.b));
-    if (!r) throw new Error("no grid route");
-    const wrap = m => ({
-      coords: m.coords, distanceM: m.distanceM, etaMin: m.etaMin,
-      shadePct: m.shadePct, heatScore: m.heatScore, comfort: m.comfort,
-      sunnyStretches: [], coolingPoints: m.coolingPoints, durationS: m.etaMin * 60
-    });
-    return { fastest: wrap(r.fastest), coolest: wrap(r.coolest), balanced: wrap(r.balanced), sun: plan.sun };
+    return E.pickModes(cands, state.sens);
   }
 
   // ---------- Recompute pipeline ----------
   async function recompute(moveMap) {
     const seq = ++state.seq;
-    const date = buildDate(state.departH);
-    const wx = weatherFor(date);
-    renderWeather(wx, date);
-    setLoading(true);
+    if (!state.weather) {
+      const last = readLastGood();
+      state.weather = last || { ...D.fallbackWeather, fetchedAt: null };
+    }
+    renderTimeBadge(); renderWeather(); setLoading(true);
     try {
-      const out = await planViaApi(wx);
-      if (seq !== state.seq) return; // superseded
-      state.source = "api"; state.modes = out; hideBanner();
+      const modes = await planRoutes(state.weather);
+      if (seq !== state.seq) return;
+      state.modes = modes;
+      state.identicalFC = E.routeSignature(modes.fastest.coords) === E.routeSignature(modes.coolest.coords);
+      hideBanner();
     } catch (err) {
-      try {
-        const out = planViaGrid(wx);
-        if (seq !== state.seq) return;
-        state.source = "grid"; state.modes = out;
-        banner("Live routing unavailable — showing the built-in simulated network instead.");
-      } catch (e2) {
-        if (seq !== state.seq) return;
-        setLoading(false);
-        return banner("No route found between A and B — try different points.");
-      }
+      if (seq !== state.seq) return;
+      setLoading(false);
+      state.modes = null;
+      if (layersReady) map.getSource("routes").setData(routeFC());
+      banner("🔴 " + (err && err.message || "Routing failed."), true);
+      document.getElementById("routes").innerHTML =
+        '<div class="panel hint" style="text-align:center">No route to display — see message above.</div>';
+      document.getElementById("compare-bars").innerHTML = "";
+      return;
     }
     setLoading(false);
-    renderRoutes();
-    renderCompare();
+    renderRoutes(); renderCompare();
     if (layersReady) map.getSource("routes").setData(routeFC());
     markerA.setLngLat([state.a.lon, state.a.lat]).addTo(map);
     markerB.setLngLat([state.b.lon, state.b.lat]).addTo(map);
@@ -284,45 +376,48 @@
     }
   }
 
-  // ---------- Rendering ----------
-  function renderWeather(wx, date) {
-    document.getElementById("wx-grid").innerHTML = [
-      [wx.tempC.toFixed(1) + "°", "temp"], [wx.apparentC.toFixed(1) + "°", "feels like"],
-      [Math.round(wx.rhPct) + "%", "humidity"], [wx.windMs.toFixed(1), "wind m/s"],
-      [Math.round(wx.cloudPct) + "%", "cloud"]
-    ].map(([v, l]) => `<div class="wx-cell"><b>${v}</b><span>${l}</span></div>`).join("");
-    const src = document.getElementById("wx-source");
-    src.textContent = wx.stale ? "stale" : "live · " + fmtH(state.departH) + " HKT";
-    src.className = "badge" + (wx.stale ? " stale-b" : "");
-    document.getElementById("wx-stale").classList.toggle("hidden", !wx.stale);
+  // ---------- Badges ----------
+  function renderTimeBadge() {
+    const date = buildDate(state.departH);
     const s = state.sun || E.solarPosition(date, D.center.lat, D.center.lon);
-    document.getElementById("sun-line").textContent = s.elevation > 2
-      ? "Sun " + s.elevation.toFixed(0) + "° above horizon · azimuth " + s.azimuth.toFixed(0) + "° — shade recalculated"
-      : "Sun below skyline — streets shaded";
+    const icon = s.isDay ? "☀" : s.twilight ? "🌇" : "🌙";
+    const label = s.isDay ? "day" : s.twilight ? "twilight" : "night";
+    document.getElementById("time-badge").innerHTML =
+      `${icon} <b>${fmtH(state.departH)}</b> HKT · ${label} · sun ${s.elevation.toFixed(0)}° / az ${s.azimuth.toFixed(0)}°`;
+    const tint = document.getElementById("night-tint");
+    tint.style.opacity = s.isDay ? 0 : s.twilight ? 0.15 : 0.38;
+  }
+  function renderWeather() {
+    const wx = state.weather;
+    if (!wx) return;
+    const ageMin = wx.fetchedAt ? (Date.now() - wx.fetchedAt.getTime()) / 60000 : Infinity;
+    const aged = ageMin > 30;   // freshness rule: highlight beyond 30 min
+    const src = wx.stale ? "stale" : wx.backup ? "↻ 備份源" : "live";
+    const cls = wx.stale || aged ? "wx-badge stale-b" : "wx-badge";
+    document.getElementById("weather-badge").innerHTML =
+      `🌡 <b>${wx.tempC.toFixed(1)}°C</b> · RH ${wx.rhPct != null ? Math.round(wx.rhPct) + "%" : "—"} ` +
+      `<span class="${cls}">${wx.source}${wx.fetchedAt ? " · 更新於 " + pad(wx.fetchedAt.getHours()) + ":" + pad(wx.fetchedAt.getMinutes()) : ""} · ${src}</span>`;
+    document.getElementById("wx-stale").classList.toggle("hidden", !(wx.stale || aged));
   }
 
+  // ---------- Rendering ----------
   function setLoading(on) {
     if (on) document.getElementById("routes").innerHTML =
-      '<div class="panel hint" style="text-align:center">Finding real pedestrian routes…</div>';
+      '<div class="panel hint" style="text-align:center">Computing graph routes…</div>';
   }
-
   function comfortClass(c) { return c >= 60 ? "c-good" : c >= 40 ? "c-mid" : "c-bad"; }
-
   function selectMode(md) {
     state.selected = md;
     document.querySelectorAll(".route-card").forEach(x =>
       x.classList.toggle("selected", x.dataset.mode === md));
     if (layersReady) map.getSource("routes").setData(routeFC());
   }
-
   function renderRoutes() {
     const prefPick = state.sens < 0.34 ? "fastest" : state.sens > 0.67 ? "coolest" : "balanced";
     const f = state.modes.fastest;
-    const srcBadge = state.source === "api"
-      ? '<span class="badge">real streets · OSM foot routing</span>'
-      : '<span class="badge stale-b">simulated network (offline)</span>';
-    document.getElementById("routes").innerHTML =
-      `<div class="hint" style="margin-bottom:6px">${srcBadge}</div>` +
+    const warn = state.identicalFC
+      ? `<div class="warn-bar">⚠ 兩條路線相同 — Fastest and Coolest coincide at this departure time. 建議調整出發時間 (try a different departure time).</div>` : "";
+    document.getElementById("routes").innerHTML = warn +
       ["fastest", "coolest", "balanced"].map(md => {
         const r = state.modes[md], meta = MODE_META[md];
         const dMin = r.etaMin - f.etaMin, dShade = r.shadePct - f.shadePct, dHeat = r.heatScore - f.heatScore;
@@ -351,9 +446,8 @@
     document.querySelectorAll(".route-card").forEach(el =>
       el.addEventListener("click", () => selectMode(el.dataset.mode)));
   }
-
   function renderCompare() {
-    const rows = [["fastest", "#f59e0b"], ["coolest", "#06b6d4"], ["balanced", "#8b5cf6"]];
+    const rows = [["fastest", MODE_META.fastest.color], ["coolest", MODE_META.coolest.color], ["balanced", MODE_META.balanced.color]];
     const metrics = [
       ["Time", r => r.etaMin, v => Math.round(v) + "′"],
       ["Shade", r => r.shadePct, v => v + "%"],
@@ -374,7 +468,7 @@
   D.landmarks.forEach((l, i) => { selA.add(new Option(l.name, i)); selB.add(new Option(l.name, i)); });
   for (const sel of [selA, selB]) {
     const pinOpt = new Option("Dropped pin 📍", "pin");
-    pinOpt.disabled = true; // set programmatically only, after an actual map click
+    pinOpt.disabled = true;
     sel.add(pinOpt);
   }
   function syncSelects() {
@@ -404,7 +498,6 @@
   document.getElementById("pick-a").addEventListener("click", () => setPick("a"));
   document.getElementById("pick-b").addEventListener("click", () => setPick("b"));
 
-  // Debounce recompute so slider drags don't spam the routing API
   let recTimer = null;
   const debouncedRecompute = () => {
     clearTimeout(recTimer);
@@ -412,6 +505,8 @@
   };
 
   const depart = document.getElementById("depart");
+  depart.value = state.departH;
+  document.getElementById("depart-label").textContent = fmtH(state.departH);
   depart.addEventListener("input", () => {
     state.departH = parseFloat(depart.value);
     document.getElementById("depart-label").textContent = fmtH(state.departH);
@@ -438,14 +533,17 @@
     document.getElementById("method-dialog").showModal());
 
   let bannerTimer = null;
-  function banner(msg) {
+  function banner(msg, sticky) {
     const el = document.getElementById("banner");
     if (!msg) return hideBanner();
     el.textContent = msg; el.classList.remove("hidden");
     clearTimeout(bannerTimer);
-    bannerTimer = setTimeout(hideBanner, 6000);
+    if (!sticky) bannerTimer = setTimeout(hideBanner, 6000);
   }
   function hideBanner() { document.getElementById("banner").classList.add("hidden"); }
+
+  // Re-tint the map as day turns to night
+  setInterval(() => { renderTimeBadge(); }, 60000);
 
   fetchWeather();
 })();

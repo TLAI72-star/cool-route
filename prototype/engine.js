@@ -1,9 +1,13 @@
-/* CoolRoute v1 prototype — deterministic thermal routing engine.
- * Implements the guide's MVP pipeline:
- *   sun position (pvlib stand-in) -> street-canyon shade -> edge heat cost
- *     EdgeHeatCost = length x (w1*HeatIndex + w2*SunExposure + w3*LowWind
- *                               + w4*SurfaceHeatProxy - w5*CoolingAccess)
- *   -> Dijkstra under three objectives: fastest / coolest / balanced.
+/* CoolRoute v2 prototype — deterministic thermal routing engine.
+ * Per CoolRoute_System_Architecture_v2 / Build_Guide_v2:
+ *   - time-aware: solar position (pvlib-equivalent NOAA approximation)
+ *   - weather-aware edge cost: cost = length × (1 + heat + sun − cool_bonus)
+ *       heat       = max(0, temp_c − 26) × 0.5          (daytime only)
+ *       sun        = (1 − shade) × max(0, sun_elev) × 0.05
+ *       cool_bonus = 1 if a cooling point is within 200 m
+ *   - shade is BINARY (0/1) from real building geometry:
+ *       a segment is shaded if any building stands between it and the sun
+ *       (bearing within ±45° of sun azimuth, distance ≤ height / tan(elev)).
  * Works in the browser (global CR_ENGINE) and in Node (module.exports) for tests.
  */
 (function (root, factory) {
@@ -12,9 +16,8 @@
   else root.CR_ENGINE = lib;
 })(typeof self !== "undefined" ? self : this, function () {
   const RAD = Math.PI / 180;
-  const WALK_M_PER_MIN = 5000 / 60; // 5 km/h
 
-  // ---- Solar position (compact NOAA approximation) ----------------------
+  // ---- Solar position (compact NOAA approximation; matches pvlib to ~0.1°)
   function solarPosition(date, lat, lon) {
     const start = Date.UTC(date.getUTCFullYear(), 0, 0);
     const doy = Math.floor((date.getTime() - start) / 86400000);
@@ -32,7 +35,13 @@
     const zen = Math.acos(Math.min(1, Math.max(-1, cosZen)));
     let az = Math.atan2(Math.sin(ha),
       Math.cos(ha) * Math.sin(lat * RAD) - Math.tan(decl) * Math.cos(lat * RAD)) / RAD + 180;
-    return { elevation: 90 - zen / RAD, azimuth: ((az % 360) + 360) % 360 };
+    const elevation = 90 - zen / RAD;
+    return {
+      elevation,
+      azimuth: ((az % 360) + 360) % 360,
+      isDay: elevation > 0,
+      twilight: elevation <= 0 && elevation > -6
+    };
   }
 
   // ---- Geo helpers -------------------------------------------------------
@@ -49,141 +58,6 @@
       - Math.sin(lat1 * RAD) * Math.cos(lat2 * RAD) * Math.cos((lon2 - lon1) * RAD);
     return ((Math.atan2(y, x) / RAD) + 360) % 360;
   }
-
-  // ---- Shade model: simplified street canyon ----------------------------
-  // Sunward-side building casts a shadow band across the street; trees and
-  // covered walkways add on top. Returns shade fraction 0..1.
-  function edgeShade(edge, nodes, sun) {
-    if (sun.elevation <= 2) return 1; // sun below skyline -> no direct sun
-    const a = nodes[edge.a], b = nodes[edge.b];
-    const axis = bearingDeg(a.lat, a.lon, b.lat, b.lon) % 180;
-    const rel = Math.abs(((sun.azimuth - axis + 540) % 360) - 180); // 0..180
-    const across = Math.abs(Math.sin(rel * RAD)); // sun component across street
-    // Which side faces the sun? Side normals are axis±90.
-    const n1 = (axis + 90) % 360, n2 = (axis + 270) % 360;
-    const d1 = Math.abs(((sun.azimuth - n1 + 540) % 360) - 180);
-    const sunH = d1 < 90 ? edge.h1 : edge.h2;
-    const shadowW = (sunH / Math.tan(sun.elevation * RAD)) * across;
-    let shade = Math.min(1, shadowW / edge.width);
-    shade = Math.max(shade, edge.covered || 0);
-    shade = shade + (1 - shade) * (edge.trees || 0) * 0.6;
-    return Math.min(1, shade);
-  }
-
-  // ---- Edge heat cost (guide §7.1) ---------------------------------------
-  const WEIGHTS = { w1: 0.35, w2: 0.30, w3: 0.10, w4: 0.15, w5: 0.10 };
-
-  function coolingAccess(midLat, midLon, coolingPoints) {
-    let best = 0;
-    for (const p of coolingPoints) {
-      const d = haversineM(midLat, midLon, p.lat, p.lon);
-      const v = d <= 50 ? 1 : d <= 120 ? 0.5 : 0;
-      if (v > best) best = v;
-    }
-    return best;
-  }
-
-  function edgeMetrics(edge, nodes, sun, weather, coolingPoints) {
-    const a = nodes[edge.a], b = nodes[edge.b];
-    const lengthM = haversineM(a.lat, a.lon, b.lat, b.lon);
-    const shade = edgeShade(edge, nodes, sun);
-    const sunExposure = 1 - shade;
-    const heatIndex = Math.min(1, Math.max(0, (weather.apparentC - 24) / 12));
-    const lowWind = Math.min(1, Math.max(0, 1 - weather.windMs / 6));
-    const cool = coolingAccess((a.lat + b.lat) / 2, (a.lon + b.lon) / 2, coolingPoints);
-    const raw = WEIGHTS.w1 * heatIndex + WEIGHTS.w2 * sunExposure
-      + WEIGHTS.w3 * lowWind + WEIGHTS.w4 * edge.surface - WEIGHTS.w5 * cool;
-    const range = WEIGHTS.w1 + WEIGHTS.w2 + WEIGHTS.w3 + WEIGHTS.w4 + WEIGHTS.w5;
-    const heat01 = Math.min(1, Math.max(0, (raw + WEIGHTS.w5) / range));
-    return {
-      lengthM, timeMin: lengthM / (WALK_M_PER_MIN * (edge.speed || 1)), shade, sunExposure,
-      heat01, heatScore: Math.round(heat01 * 100), comfort: Math.round((1 - heat01) * 100),
-      cooling: cool
-    };
-  }
-
-  // ---- Graph + Dijkstra ---------------------------------------------------
-  function buildAdjacency(data) {
-    const adj = {};
-    for (const id of Object.keys(data.nodes)) adj[id] = [];
-    for (const e of data.edges) { adj[e.a].push(e); adj[e.b].push(e); }
-    return adj;
-  }
-
-  function dijkstra(adj, startId, endId, edgeCost) {
-    const dist = { [startId]: 0 }, prev = {}, done = new Set();
-    const queue = [[0, startId]];
-    while (queue.length) {
-      queue.sort((x, y) => x[0] - y[0]);
-      const [d, u] = queue.shift();
-      if (done.has(u)) continue;
-      done.add(u);
-      if (u === endId) break;
-      for (const e of adj[u]) {
-        const v = e.a === u ? e.b : e.a;
-        const nd = d + edgeCost(e);
-        if (dist[v] === undefined || nd < dist[v]) {
-          dist[v] = nd; prev[v] = { from: u, edge: e };
-          queue.push([nd, v]);
-        }
-      }
-    }
-    if (dist[endId] === undefined) return null;
-    const path = [], edgesPath = [];
-    let cur = endId;
-    while (cur !== startId) { path.unshift(cur); edgesPath.unshift(prev[cur].edge); cur = prev[cur].from; }
-    path.unshift(startId);
-    return { nodes: path, edges: edgesPath, cost: dist[endId] };
-  }
-
-  // ---- Route planning: three objectives ----------------------------------
-  function planRoutes(data, weather, date, sensitivity) {
-    const sun = solarPosition(date, data.center.lat, data.center.lon);
-    const adj = buildAdjacency(data);
-    const m = {}; // edgeId -> metrics
-    for (const e of data.edges) m[e.id] = edgeMetrics(e, data.nodes, sun, weather, data.coolingPoints);
-
-    const lambda = 0.4 + 2.0 * (sensitivity ?? 0.5); // heat-sensitivity preference
-    const costs = {
-      fastest: e => m[e.id].timeMin,
-      coolest: e => m[e.id].lengthM * (0.15 + 0.85 * m[e.id].heat01),
-      balanced: e => m[e.id].timeMin * (1 + lambda * m[e.id].heat01)
-    };
-
-    function solve(startId, endId) {
-      const out = {};
-      for (const mode of ["fastest", "coolest", "balanced"]) {
-        const r = dijkstra(adj, startId, endId, costs[mode]);
-        if (!r) return null;
-        let len = 0, time = 0, shadeAcc = 0, heatAcc = 0;
-        const coords = [];
-        for (const e of r.edges) {
-          const em = m[e.id];
-          len += em.lengthM; time += em.timeMin;
-          shadeAcc += em.shade * em.lengthM; heatAcc += em.heat01 * em.lengthM;
-        }
-        r.nodes.forEach((n, i) => { if (i === 0 || n !== r.nodes[i - 1]) coords.push([data.nodes[n].lon, data.nodes[n].lat]); });
-        const passed = data.coolingPoints.filter(p =>
-          r.nodes.some(n => haversineM(data.nodes[n].lat, data.nodes[n].lon, p.lat, p.lon) <= 45));
-        out[mode] = {
-          mode, nodePath: r.nodes, edgeIds: r.edges.map(e => e.id), coords,
-          distanceM: Math.round(len), etaMin: Math.round(time * 10) / 10,
-          shadePct: Math.round((shadeAcc / len) * 100),
-          heatScore: Math.round((heatAcc / len) * 100),
-          comfort: Math.round((1 - heatAcc / len) * 100),
-          coolingPoints: passed
-        };
-      }
-      return out;
-    }
-    return { sun, edgeMetrics: m, solve };
-  }
-
-  // ============================================================
-  // Real-route scoring: OSRM foot geometry + thermal model
-  // ============================================================
-
-  // Split a LineString into segments of at most maxLenM, with midpoints/bearings
   function splitLine(coords, maxLenM) {
     const segs = [];
     for (let i = 0; i < coords.length - 1; i++) {
@@ -203,102 +77,161 @@
     }
     return segs;
   }
-
-  // "德輔道中 Des Voeux Road Central" -> "des voeux road central"
   function englishName(raw) {
     return (raw || "")
       .replace(/[㐀-鿿豈-﫿]/g, " ")
-      .replace(/['']/g, "'")
+      .replace(/['’]/g, "'")
       .replace(/\s+/g, " ").trim().toLowerCase();
   }
 
-  function canyonForName(rawName, streetTable, coveredHints, defaultCanyon, unnamedCanyon) {
-    const en = englishName(rawName);
-    const openDefault = unnamedCanyon || { w: 8, h: 10, trees: 0.15, surface: 0.80, covered: 0 };
-    let params = { ...(en ? defaultCanyon : openDefault) };
-    if (en) {
-      for (const key of Object.keys(streetTable)) {
-        if (en.includes(key) || (en.length >= 6 && key.includes(en))) {
-          params = { ...params, ...streetTable[key] };
-          break;
-        }
-      }
-      for (const [kw, cov] of coveredHints) {
-        if (en.includes(kw)) params.covered = Math.max(params.covered || 0, cov);
-      }
+  // ---- Building spatial index --------------------------------------------
+  const SHADE_H_CAP = 60;    // beyond ~60 m a Central canyon is always blocked
+  const SEARCH_R = 350;      // max building distance considered (m)
+
+  function buildBuildingIndex(fc) {
+    const CELL = 0.0015; // ≈ 160 m
+    const grid = new Map();
+    for (const f of fc.features) {
+      const b = {
+        lon: f._centroid[0], lat: f._centroid[1], r: f._radius,
+        h: Math.min(f.properties.height, SHADE_H_CAP),
+        ring: f.geometry.coordinates[0]
+      };
+      const k = Math.floor(b.lat / CELL) + ":" + Math.floor(b.lon / CELL);
+      if (!grid.has(k)) grid.set(k, []);
+      grid.get(k).push(b);
     }
-    return { params, en };
+    return { grid, CELL };
+  }
+  function nearbyBuildings(idx, lat, lon, radiusM) {
+    const dLat = radiusM / 111320, dLon = radiusM / (111320 * Math.cos(lat * RAD));
+    const out = [];
+    for (let la = Math.floor((lat - dLat) / idx.CELL); la <= Math.floor((lat + dLat) / idx.CELL); la++)
+      for (let lo = Math.floor((lon - dLon) / idx.CELL); lo <= Math.floor((lon + dLon) / idx.CELL); lo++) {
+        const arr = idx.grid.get(la + ":" + lo);
+        if (arr) for (const b of arr) out.push(b);
+      }
+    return out;
   }
 
-  // Shade for one segment given its bearing and canyon params
-  function segmentShade(bearing, p, sun) {
-    if ((p.covered || 0) >= 1) return 1;
-    if (sun.elevation <= 2) return 1;
-    const axis = bearing % 180;
-    const rel = Math.abs(((sun.azimuth - axis + 540) % 360) - 180);
-    const across = Math.abs(Math.sin(rel * RAD));
-    let shade = p.h > 0
-      ? Math.min(1, (p.h / Math.tan(sun.elevation * RAD)) * across / p.w)
-      : 0;
-    shade = Math.max(shade, p.covered || 0);
-    shade = shade + (1 - shade) * (p.trees || 0) * 0.6;
-    return Math.min(1, shade);
+  // Distance (m) / containment against a real polygon ring (equirectangular approx)
+  function pointInRing(lat, lon, ring) {
+    let inside = false;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const [xi, yi] = ring[i], [xj, yj] = ring[j];
+      if ((yi > lat) !== (yj > lat) && lon < (xj - xi) * (lat - yi) / (yj - yi) + xi) inside = !inside;
+    }
+    return inside;
+  }
+  function distToRingM(lat, lon, ring) {
+    const kx = 111320 * Math.cos(lat * RAD), ky = 111320;
+    let best = Infinity;
+    for (let i = 0; i < ring.length - 1; i++) {
+      const ax = (ring[i][0] - lon) * kx, ay = (ring[i][1] - lat) * ky;
+      const bx = (ring[i + 1][0] - lon) * kx, by = (ring[i + 1][1] - lat) * ky;
+      const dx = bx - ax, dy = by - ay;
+      const t = Math.max(0, Math.min(1, -(ax * dx + ay * dy) / (dx * dx + dy * dy || 1)));
+      const px = ax + t * dx, py = ay + t * dy;
+      const d = Math.hypot(px, py);
+      if (d < best) best = d;
+    }
+    return best;
   }
 
-  // Score one API route candidate thermally.
-  // candidate: { distanceM, durationS, coords, steps: [{name, coords}] }
-  // ctx: { sun, weather, coolingPoints, streetTable, coveredHints, defaultCanyon }
+  // ---- Binary shade (guide Step 6: 0/1, simplified building geometry) -----
+  function binaryShade(midLat, midLon, sun, bidx, covered) {
+    if (covered) return 1;
+    if (sun.elevation <= 0) return 1; // night: no direct sun
+    const elev = Math.max(sun.elevation, 2);
+    const tanE = Math.tan(elev * RAD);
+    for (const b of nearbyBuildings(bidx, midLat, midLon, SEARCH_R)) {
+      const cd = haversineM(midLat, midLon, b.lat, b.lon);
+      if (cd - b.r > b.h / tanE) continue;         // centroid too far even for shadow
+      const brg = bearingDeg(midLat, midLon, b.lat, b.lon);
+      const diff = Math.abs(((brg - sun.azimuth + 540) % 360) - 180);
+      if (diff > 45) continue;                     // building not toward the sun
+      if (pointInRing(midLat, midLon, b.ring)) return 1;
+      if (distToRingM(midLat, midLon, b.ring) <= b.h / tanE) return 1;
+    }
+    return 0;
+  }
+
+  // ---- Cooling access ------------------------------------------------------
+  function coolingWithin(midLat, midLon, coolingPoints, maxM) {
+    let best = Infinity;
+    for (const p of coolingPoints) {
+      const d = haversineM(midLat, midLon, p.lat, p.lon);
+      if (d < best) best = d;
+    }
+    return best <= maxM;
+  }
+
+  // ---- v2 edge cost + candidate scoring ------------------------------------
+  // ctx: { sun, weather:{tempC}, bidx, coolingPoints, coveredHints }
   function scoreCandidate(cand, ctx) {
-    const { sun, weather, coolingPoints } = ctx;
-    const heatIndex = Math.min(1, Math.max(0, (weather.apparentC - 24) / 12));
-    const lowWind = Math.min(1, Math.max(0, 1 - weather.windMs / 6));
-    const range = WEIGHTS.w1 + WEIGHTS.w2 + WEIGHTS.w3 + WEIGHTS.w4 + WEIGHTS.w5;
+    const { sun, weather } = ctx;
+    const heat = sun.isDay ? Math.max(0, weather.tempC - 26) * 0.5 : 0;
+    const sunElevPen = Math.max(0, sun.elevation) * 0.05;
 
-    let len = 0, shadeAcc = 0, heatAcc = 0;
-    const sunByStreet = {}; // name -> {sunLen, totalLen}
+    let len = 0, cost = 0, shadeLen = 0;
+    const sunByStreet = {};
     for (const step of cand.steps) {
-      const { params, en } = canyonForName(step.name, ctx.streetTable, ctx.coveredHints, ctx.defaultCanyon, ctx.unnamedCanyon);
+      const en = englishName(step.name);
+      let covered = false;
+      for (const [kw] of ctx.coveredHints) if (en.includes(kw)) { covered = true; break; }
       const label = en || "(footpath / plaza)";
       for (const seg of splitLine(step.coords, 30)) {
-        const shade = segmentShade(seg.bearing, params, sun);
-        const sunE = 1 - shade;
-        const cool = coolingAccess(seg.midLat, seg.midLon, coolingPoints);
-        const raw = WEIGHTS.w1 * heatIndex + WEIGHTS.w2 * sunE
-          + WEIGHTS.w3 * lowWind + WEIGHTS.w4 * params.surface - WEIGHTS.w5 * cool;
-        const heat01 = Math.min(1, Math.max(0, (raw + WEIGHTS.w5) / range));
-        len += seg.lenM; shadeAcc += shade * seg.lenM; heatAcc += heat01 * seg.lenM;
-        const b = sunByStreet[label] || (sunByStreet[label] = { sunLen: 0, totalLen: 0 });
-        b.totalLen += seg.lenM; if (sunE > 0.6) b.sunLen += seg.lenM;
+        const shade = binaryShade(seg.midLat, seg.midLon, sun, ctx.bidx, covered);
+        const sunPen = (1 - shade) * sunElevPen;
+        const coolBonus = coolingWithin(seg.midLat, seg.midLon, ctx.coolingPoints, 200) ? 1 : 0;
+        const segCost = seg.lenM * (1 + heat + sunPen - coolBonus);
+        len += seg.lenM; cost += segCost; shadeLen += shade * seg.lenM;
+        const b = sunByStreet[label] || (sunByStreet[label] = { sunLen: 0 });
+        if (shade === 0 && sun.isDay) b.sunLen += seg.lenM;
       }
     }
     if (len === 0) return null;
-    const heat01 = heatAcc / len;
+    const avgPenalty = cost / len - 1;                       // heat + sun − cool, per metre
+    const heat01 = Math.min(1, Math.max(0, (avgPenalty + 1) / 11.5));
     const sunnyStretches = Object.entries(sunByStreet)
       .filter(([, v]) => v.sunLen >= 25)
       .sort((a, b) => b[1].sunLen - a[1].sunLen)
       .slice(0, 3)
       .map(([name, v]) => ({ name, lenM: Math.round(v.sunLen) }));
-    const passed = coolingPoints.filter(p =>
+    const passed = ctx.coolingPoints.filter(p =>
       cand.coords.some(([lon, lat]) => haversineM(lat, lon, p.lat, p.lon) <= 45));
     return {
       distanceM: Math.round(cand.distanceM || len),
       etaMin: Math.round((cand.durationS / 60) * 10) / 10,
-      shadePct: Math.round((shadeAcc / len) * 100),
+      shadePct: Math.round((shadeLen / len) * 100),
       heatScore: Math.round(heat01 * 100),
       comfort: Math.round((1 - heat01) * 100),
-      heatCost: len * (0.15 + 0.85 * heat01),
+      totalCost: cost,
       sunnyStretches, coolingPoints: passed
     };
   }
 
-  // Geometry signature for deduplication
   function routeSignature(coords) {
     return coords.filter((_, i) => i % 4 === 0)
       .map(c => c[0].toFixed(4) + "," + c[1].toFixed(4)).join(";");
   }
 
+  // Mode picks per guide: fastest = min time, coolest = min heat cost,
+  // balanced = time × (1 + λ·penalty), λ grows with heat sensitivity.
+  function pickModes(cands, sensitivity) {
+    const lambda = 0.4 + 2.0 * (sensitivity ?? 0.5);
+    const pick = fn => cands.reduce((best, c) => fn(c) < fn(best) ? c : best, cands[0]);
+    return {
+      fastest: pick(c => c.durationS),
+      coolest: pick(c => c.totalCost),
+      balanced: pick(c => c.durationS * (1 + lambda * Math.min(1, Math.max(0,
+        (c.totalCost / Math.max(1, c.distanceM) - 1) / 10))))
+    };
+  }
+
   return {
-    solarPosition, haversineM, bearingDeg, edgeShade, edgeMetrics, planRoutes, WEIGHTS, WALK_M_PER_MIN,
-    splitLine, englishName, canyonForName, segmentShade, scoreCandidate, routeSignature, coolingAccess
+    solarPosition, haversineM, bearingDeg, splitLine, englishName,
+    buildBuildingIndex, nearbyBuildings, binaryShade, coolingWithin,
+    scoreCandidate, routeSignature, pickModes, SHADE_H_CAP, SEARCH_R
   };
 });
